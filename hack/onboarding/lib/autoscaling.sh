@@ -14,46 +14,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# autoscaling.sh - configure WorkerPool HPA + capacity buffer.
+# autoscaling.sh - configure WorkerPool HPA (capacity buffer = minReplicas,
+# a warm floor of workers kept ready ahead of demand -- see config.sh).
 #
 # Runs after a virt-capable node pool exists (see workerpool.sh) and
-# before the default WorkerPool is deployed. Doesn't touch the node pool
-# or the WorkerPool resource itself -- just decides how (or whether)
-# autoscaling gets configured.
+# before the default WorkerPool is deployed (workerpool.sh's
+# deploy_default_workerpool) -- so the HPA this applies necessarily
+# targets a WorkerPool that doesn't exist yet. That's fine: an HPA
+# doesn't require its scaleTargetRef to exist at creation time (the HPA
+# controller just reports FailedGetScale until the target appears), and
+# it does need to match the *name* install_workerpool will use ("default"
+# in DEFAULT_WORKERPOOL_NAMESPACE, config.sh) for the two to connect once
+# that step runs. If the user later declines to deploy the default
+# WorkerPool (deploy_default_workerpool's own yes/no), the HPA applied
+# here just stays permanently dangling -- a known, reasonable consequence
+# of the two steps being independently skippable, not a bug.
 #
 # Public entry point: configure_workerpool_autoscaling
 # Sets (on success): AUTOSCALING_MODE ("auto" | "manual" | "skip")
 
+# autoscaling_manifest
+# The real HPA manifest, shared by configure_autoscaling_defaults (which
+# applies it) and print_manual_autoscaling_commands (which just prints
+# it) so the two can't drift apart.
+#
+# CPU Resource metric, not the ate_workerpool_workers external metric
+# demos/autoscaled-workerpool/hpa-kind.yaml uses: that one needs a
+# self-hosted Prometheus + prometheus-adapter stack (see that demo's
+# prometheus-adapter.yaml) which isn't set up anywhere in this onboarding
+# flow and is a materially bigger commitment (the same shape of decision
+# as install_workerpool's demo-vs-minimal choice in workerpool.sh) --
+# deliberately chosen against here in favor of a CPU metric, which needs
+# nothing beyond metrics-server (already on every GKE cluster).
+autoscaling_manifest() {
+  cat <<EOF
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: default
+  namespace: ${DEFAULT_WORKERPOOL_NAMESPACE}
+spec:
+  scaleTargetRef:
+    apiVersion: ate.dev/v1alpha1
+    kind: WorkerPool
+    name: default
+  minReplicas: ${DEFAULT_HPA_MIN_REPLICAS}
+  maxReplicas: ${DEFAULT_HPA_MAX_REPLICAS}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: ${DEFAULT_HPA_TARGET_CPU_UTILIZATION}
+EOF
+}
+
 # configure_autoscaling_defaults
-# TODO(kubectl): apply an HPA + capacity buffer config using the
-# DEFAULT_HPA_*/DEFAULT_CAPACITY_BUFFER_SIZE values from config.sh
-# against WORKERPOOL_NODEPOOL_NAME's WorkerPool, e.g. something like:
-#   kubectl apply -f <rendered HPA manifest>
+# Applies autoscaling_manifest via kubectl (a plain k8s object -- no
+# ko:// image reference, unlike the WorkerPool CR itself, so run_kubectl
+# is the right tool here, not `ko apply`). Also ensures
+# DEFAULT_WORKERPOOL_NAMESPACE exists first: at this point in the flow
+# workerpool.sh's install_workerpool (which normally creates it) hasn't
+# necessarily run yet.
 configure_autoscaling_defaults() {
-  log_stub "configuring HPA + capacity buffer with defaults (kubectl apply)"
-  log_info "min=${DEFAULT_HPA_MIN_REPLICAS} max=${DEFAULT_HPA_MAX_REPLICAS} target-cpu=${DEFAULT_HPA_TARGET_CPU_UTILIZATION}% capacity-buffer=${DEFAULT_CAPACITY_BUFFER_SIZE}"
-  spinner_wait "Applying autoscaling configuration..." 1
+  require_cmd kubectl
+
+  run_kubectl create namespace "${DEFAULT_WORKERPOOL_NAMESPACE}" --dry-run=client -o yaml | run_kubectl apply -f -
+  autoscaling_manifest | run_kubectl apply -f -
 }
 
 # print_manual_autoscaling_commands
-# TODO: print the real kubectl command(s)/manifest a user would apply by
-# hand to configure HPA + capacity buffer themselves.
+# Prints the same real manifest configure_autoscaling_defaults applies,
+# for the user to review/edit and apply themselves.
 print_manual_autoscaling_commands() {
-  cat <<EOF
-
-  # TODO(kubectl): replace with the real command(s)/manifest.
-  kubectl apply -f - <<'MANIFEST'
-  apiVersion: autoscaling/v2
-  kind: HorizontalPodAutoscaler
-  metadata:
-    name: CHANGEME
-  spec:
-    minReplicas: MIN_REPLICAS
-    maxReplicas: MAX_REPLICAS
-    # ... capacity buffer settings TBD
-  MANIFEST
-
-EOF
+  echo
+  echo "  kubectl apply -f - <<'MANIFEST'"
+  autoscaling_manifest | sed 's/^/  /'
+  echo "  MANIFEST"
+  echo
 }
 
 # configure_workerpool_autoscaling

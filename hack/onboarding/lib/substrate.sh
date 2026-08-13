@@ -17,28 +17,64 @@
 # substrate.sh - detect and install the Agent Substrate control plane.
 #
 # Public entry point: ensure_substrate_control_plane
+# Requires: KUBECTL_CONTEXT (set by cluster.sh's select_cluster)
+# Calls into registry.sh's ensure_docker_repo on the install branch --
+# see that file for why it isn't a top-level onboard.sh step itself.
 
 # is_substrate_installed
-# TODO(kubectl): check for the real marker of an installed control plane,
-# e.g. the ate-system namespace existing, or the WorkerPool/Actor CRDs
-# being registered:
-#   kubectl get ns ate-system
-#   kubectl get crd workerpools.<group>
+# Checks for the ate-controller Deployment in the ate-system namespace --
+# the core control-plane component hack/install-ate.sh's own
+# deploy_ate_system() waits on via `rollout status` before considering
+# itself done, so its presence is a reliable "is it installed" signal.
+#
+# Both stdout and stderr are suppressed here (unlike most other checks in
+# this script), because "not found" is the expected, common outcome on a
+# first run, not a failure to diagnose -- ensure_substrate_control_plane
+# already treats it as a normal branch (prompt to install). A deeper
+# problem (e.g. the cluster being unreachable) will still surface loudly
+# the moment install_control_plane actually talks to it.
 #
 # Returns 0 if installed, 1 otherwise.
 is_substrate_installed() {
-  log_stub "checking for an existing Agent Substrate control plane (kubectl get ns ate-system)"
-  [[ "${ONBOARD_STUB_SUBSTRATE_INSTALLED}" == "true" ]]
+  require_cmd kubectl
+  run_kubectl get deployment ate-controller -n ate-system -o name >/dev/null 2>&1
 }
 
 # install_control_plane
-# TODO: this is presumably `hack/install-ate.sh --deploy-ate-system`
-# pointed at the selected cluster, possibly with a curated flag set for
-# the quickstart path (default ateapi-client-auth, default router, etc).
+# Runs the real installer, hack/install-ate.sh --deploy-ate-system,
+# targeting the selected cluster via the KUBECTL_CONTEXT env var --
+# install-ate.sh already reads that itself and skips its own
+# `gcloud container clusters get-credentials` step when it's set (see the
+# comment at the top of that script). Flags come from config.sh rather
+# than being omitted and silently inheriting install-ate.sh's own
+# defaults, so the Quickstart choice is visible and stays put even if
+# those defaults change later.
+#
+# NO_DEV_ENV=true is required, not optional: install-ate.sh conditionally
+# sources a developer's local .ate-dev-env.sh, which -- confirmed by
+# testing against this machine's real one -- can `export KUBECTL_CONTEXT=`
+# (empty), clobbering the value set below and silently falling back to
+# fetching credentials for whatever cluster that dev-env file names
+# instead of the one actually selected in this wizard. NO_DEV_ENV skips
+# that sourcing entirely, exactly as install-ate.sh's own author designed
+# it to for callers that already know their target cluster.
+#
+# That same skip is also why KO_DOCKER_REPO is passed explicitly here:
+# .ate-dev-env.sh normally sets it, and with that file skipped, `ko`
+# (which install-ate.sh uses internally to build/push images) has no
+# other source for it and fails outright otherwise. KO_DOCKER_REPO must
+# already be set by the caller -- see ensure_substrate_control_plane.
 install_control_plane() {
-  log_stub "installing Agent Substrate control plane (hack/install-ate.sh --deploy-ate-system)"
-  spinner_wait "Deploying CRDs, atelet, ate-apiserver..." 1
-  spinner_wait "Waiting for control plane pods to become ready..." 1
+  local install_script="${SCRIPT_DIR}/../install-ate.sh"
+  if [[ ! -x "${install_script}" ]]; then
+    log_error "Could not find hack/install-ate.sh (expected at ${install_script})."
+    exit 1
+  fi
+
+  NO_DEV_ENV=true KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" KO_DOCKER_REPO="${KO_DOCKER_REPO}" "${install_script}" \
+    --deploy-ate-system \
+    --ateapi-client-auth="${DEFAULT_ATEAPI_CLIENT_AUTH}" \
+    --atenet-router="${DEFAULT_ATENET_ROUTER}"
 }
 
 # ensure_substrate_control_plane
@@ -56,6 +92,8 @@ ensure_substrate_control_plane() {
     log_info "Cancelled. Nothing was changed."
     exit 0
   fi
+
+  ensure_docker_repo
 
   log_step "Installing Agent Substrate control plane"
   install_control_plane

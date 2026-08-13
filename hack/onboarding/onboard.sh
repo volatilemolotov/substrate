@@ -28,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/ui.sh"
 source "${SCRIPT_DIR}/lib/config.sh"
 source "${SCRIPT_DIR}/lib/cluster.sh"
+source "${SCRIPT_DIR}/lib/registry.sh"
 source "${SCRIPT_DIR}/lib/substrate.sh"
 source "${SCRIPT_DIR}/lib/workerpool.sh"
 source "${SCRIPT_DIR}/lib/autoscaling.sh"
@@ -44,10 +45,8 @@ WorkerPool.
 Options:
   -h, --help    Show this help and exit
 
-Environment (for exercising the flow before real gcloud/kubectl calls
-are wired in -- see ONBOARDING.md):
-  ONBOARD_STUB_SUBSTRATE_INSTALLED=true|false   (default: false)
-  ONBOARD_STUB_VIRT_NODEPOOL_FOUND=true|false   (default: false)
+Environment:
+  ONBOARD_DISABLE_FZF=true   use the plain numbered menu instead of fzf
 EOF
 }
 

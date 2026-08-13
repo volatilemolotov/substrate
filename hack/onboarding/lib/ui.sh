@@ -74,7 +74,7 @@ print_banner() {
 #
 # All logging goes to stderr, never stdout. Several functions in the lib/
 # modules return their actual result by echoing to stdout and are called
-# via command substitution (e.g. `name="$(list_clusters)"`); if a log
+# via command substitution (e.g. `name="$(list_kubeconfig_contexts)"`); if a log
 # helper wrote to stdout, its text would silently become part of that
 # return value. Keep it this way even though a few call sites don't
 # currently capture output, so it's never a landmine when they start to.
@@ -158,6 +158,41 @@ select_from_list() {
     fi
     echo "Invalid selection, try again." >&2
   done
+}
+
+# require_cmd NAME [HINT]
+# Exits with a clear error if NAME isn't on PATH. Meant for the top of
+# any function that's about to shell out to an external tool (gcloud,
+# kubectl, ...).
+require_cmd() {
+  local name="$1" hint="${2:-}"
+  if ! command -v "${name}" >/dev/null 2>&1; then
+    log_error "'${name}' is required but was not found on PATH.${hint:+ ${hint}}"
+    exit 1
+  fi
+}
+
+# run_kubectl ARGS...
+# Wraps kubectl with --context=$KUBECTL_CONTEXT when it's set (cluster.sh
+# sets it after cluster selection), then forwards to kubectl. The
+# --context part mirrors run_kubectl() in hack/install-ate.sh exactly, so
+# every kubectl call in this script targets the selected cluster
+# explicitly instead of relying on -- and never needing to change --
+# whatever kubeconfig's current-context happens to be.
+#
+# The whole call is wrapped in the external `timeout` command (GNU
+# coreutils; this repo already assumes a Linux dev environment, see
+# other hack/ scripts), not just kubectl's own --request-timeout flag.
+# Discovered the hard way: with a stale gcloud auth token,
+# gke-gcloud-auth-plugin can hang trying to obtain a token *before*
+# kubectl ever issues the request that --request-timeout would bound --
+# --request-timeout is kept too, belt and suspenders, but `timeout` is
+# what actually guarantees this can't stall the wizard indefinitely.
+run_kubectl() {
+  timeout "${DEFAULT_KUBECTL_REQUEST_TIMEOUT}" kubectl \
+    ${KUBECTL_CONTEXT:+--context=${KUBECTL_CONTEXT}} \
+    --request-timeout="${DEFAULT_KUBECTL_REQUEST_TIMEOUT}" \
+    "$@"
 }
 
 # spinner_wait MESSAGE SECONDS

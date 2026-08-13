@@ -24,58 +24,90 @@
 #   deploy_default_workerpool - ask yes/no, deploy the WorkerPool if so
 
 # find_virt_nodepool
-# TODO(gcloud): list node pools for CLUSTER_NAME and find one with
-# nested virtualization enabled, e.g.:
-#   gcloud container node-pools list --cluster="${CLUSTER_NAME}" \
-#     --project="${CLUSTER_PROJECT}" --location="${CLUSTER_LOCATION}" \
-#     --format=json
-# then check each pool's `config.advancedMachineFeatures.enableNestedVirtualization`
-# (and/or a suitable machine family) for a match.
+# Lists node pools on the selected cluster and looks for one with nested
+# virtualization enabled (config.advancedMachineFeatures.enableNestedVirtualization
+# in the raw API resource -- confirmed via a live `--format=json` call;
+# note this is NOT reachable through `--format=value(...)`, per the same
+# gcloud display-transform behavior documented in registry.sh for
+# Artifact Registry repos, so this uses json+jq too rather than value()).
 #
-# Prints the matching node pool name to stdout if found, prints nothing
-# and returns 1 if not found.
+# Prints the first match's name to stdout. Returns 1 either because the
+# gcloud call itself failed (logged before returning) or because no pool
+# matched (silent -- ensure_virt_nodepool has its own message for that).
 find_virt_nodepool() {
-  log_stub "looking for a node pool with hardware virtualization enabled (gcloud container node-pools list)"
-  if [[ "${ONBOARD_STUB_VIRT_NODEPOOL_FOUND}" == "true" ]]; then
-    echo "existing-virt-pool"
-    return 0
+  require_cmd gcloud
+  require_cmd jq
+
+  local json
+  if ! json="$(gcloud container node-pools list \
+    --cluster="${CLUSTER_NAME}" --project="${CLUSTER_PROJECT}" --location="${CLUSTER_LOCATION}" \
+    --format=json)"; then
+    log_error "gcloud failed to list node pools for cluster '${CLUSTER_NAME}'. See the error above and check your gcloud setup."
+    return 1
   fi
-  return 1
+
+  local pool_name
+  pool_name="$(echo "${json}" | jq -r '
+    [.[] | select(.config.advancedMachineFeatures.enableNestedVirtualization == true)][0].name // empty
+  ')"
+
+  [[ -n "${pool_name}" ]] || return 1
+  echo "${pool_name}"
 }
 
 # create_workerpool_nodepool_defaults
-# TODO(gcloud): create a node pool using the DEFAULT_WORKERPOOL_* values
-# from config.sh, with nested virtualization enabled, e.g. roughly:
-#   gcloud container node-pools create "${DEFAULT_WORKERPOOL_NODEPOOL_NAME}" \
-#     --cluster="${CLUSTER_NAME}" --project="${CLUSTER_PROJECT}" \
-#     --location="${CLUSTER_LOCATION}" \
-#     --machine-type="${DEFAULT_WORKERPOOL_MACHINE_TYPE}" \
-#     --num-nodes="${DEFAULT_WORKERPOOL_NODE_COUNT}" \
-#     --disk-size="${DEFAULT_WORKERPOOL_DISK_SIZE_GB}" \
-#     --enable-nested-virtualization   # (flag name TBD)
+# Creates a node pool using the DEFAULT_WORKERPOOL_* values from
+# config.sh, with nested virtualization enabled.
 #
-# Prints the created node pool name to stdout.
+# --enable-nested-virtualization (confirmed via `gcloud container
+# node-pools create --help`) requires UBUNTU_CONTAINERD, or
+# COS_CONTAINERD at version 1.28.4-gke.1083000+ -- not forcing
+# --image-type here since the default is COS_CONTAINERD and
+# MIN_GKE_VERSION (config.sh) is already well above that floor, so the
+# node pool's image should qualify without an explicit override.
+#
+# Prints the created node pool name to stdout. Unlike this file's other
+# gcloud calls (list/describe with an explicit --format), `create`
+# prints a human-readable result table to stdout by default -- stdout is
+# redirected to /dev/null here (stderr stays visible for real errors) so
+# that table can't get captured into WORKERPOOL_NODEPOOL_NAME alongside
+# the real name via the caller's `$(...)`. Found the hard way: it did,
+# corrupting the variable with multi-line text (including colons), which
+# then broke YAML parsing when interpolated into install_workerpool's
+# manifest ("could not find expected ':'" from ko/go-yaml).
 create_workerpool_nodepool_defaults() {
-  log_stub "creating node pool '${DEFAULT_WORKERPOOL_NODEPOOL_NAME}' with defaults (gcloud container node-pools create)"
+  require_cmd gcloud
+
   log_info "machine-type=${DEFAULT_WORKERPOOL_MACHINE_TYPE} nodes=${DEFAULT_WORKERPOOL_NODE_COUNT} disk=${DEFAULT_WORKERPOOL_DISK_SIZE_GB}GB"
-  spinner_wait "Creating node pool..." 1
+
+  if ! gcloud container node-pools create "${DEFAULT_WORKERPOOL_NODEPOOL_NAME}" \
+    --cluster="${CLUSTER_NAME}" --project="${CLUSTER_PROJECT}" --location="${CLUSTER_LOCATION}" \
+    --machine-type="${DEFAULT_WORKERPOOL_MACHINE_TYPE}" \
+    --num-nodes="${DEFAULT_WORKERPOOL_NODE_COUNT}" \
+    --disk-size="${DEFAULT_WORKERPOOL_DISK_SIZE_GB}" \
+    --enable-nested-virtualization >/dev/null; then
+    log_error "gcloud failed to create node pool '${DEFAULT_WORKERPOOL_NODEPOOL_NAME}'. See the error above and check your gcloud setup."
+    return 1
+  fi
+
   echo "${DEFAULT_WORKERPOOL_NODEPOOL_NAME}"
 }
 
 # print_manual_nodepool_commands
-# TODO: print the real gcloud command(s) a user would run by hand,
-# pre-filled with CLUSTER_NAME/CLUSTER_PROJECT/CLUSTER_LOCATION.
+# Prints the real gcloud command a user would run by hand, pre-filled
+# with the selected cluster and the same defaults
+# create_workerpool_nodepool_defaults would use (still editable -- this
+# is a starting point, not a locked-in choice).
 print_manual_nodepool_commands() {
   cat <<EOF
 
-  # TODO(gcloud): replace with the real command(s).
   gcloud container node-pools create NODE_POOL_NAME \\
     --cluster="${CLUSTER_NAME}" \\
     --project="${CLUSTER_PROJECT}" \\
     --location="${CLUSTER_LOCATION}" \\
-    --machine-type=MACHINE_TYPE \\
+    --machine-type="${DEFAULT_WORKERPOOL_MACHINE_TYPE}" \\
     --num-nodes=NODE_COUNT \\
-    --enable-nested-virtualization   # flag name TBD
+    --enable-nested-virtualization
 
 EOF
 }
@@ -104,7 +136,10 @@ ensure_virt_nodepool() {
   case "${choice}" in
     "Create it now using recommended defaults")
       log_step "Creating worker node pool with defaults"
-      WORKERPOOL_NODEPOOL_NAME="$(create_workerpool_nodepool_defaults)"
+      if ! WORKERPOOL_NODEPOOL_NAME="$(create_workerpool_nodepool_defaults)"; then
+        log_error "Failed to create the node pool. See the error above."
+        exit 1
+      fi
       log_success "Created node pool: ${WORKERPOOL_NODEPOOL_NAME}"
       ;;
     "I'll run the gcloud commands myself")
@@ -114,9 +149,15 @@ ensure_virt_nodepool() {
         log_info "Cancelled. Nothing was changed."
         exit 0
       fi
-      # TODO(gcloud): re-run find_virt_nodepool to confirm + capture the
-      # real name instead of trusting the user's input blindly.
-      read -r -p "Node pool name: " WORKERPOOL_NODEPOOL_NAME
+      # Re-run the real check rather than trusting a typed-in name: this
+      # both confirms nested virtualization actually took (not just that
+      # *a* node pool exists) and avoids a typo silently pointing later
+      # steps at a pool that doesn't exist.
+      if ! WORKERPOOL_NODEPOOL_NAME="$(find_virt_nodepool)"; then
+        log_error "Still couldn't find a node pool with hardware virtualization enabled on ${CLUSTER_NAME}. Check that the command above succeeded, then re-run this script."
+        exit 1
+      fi
+      log_success "Verified node pool: ${WORKERPOOL_NODEPOOL_NAME}"
       ;;
     "Cancel")
       log_info "Cancelled. Nothing was changed."
@@ -126,11 +167,63 @@ ensure_virt_nodepool() {
 }
 
 # install_workerpool
-# TODO: presumably `hack/install-demo-autoscaled-workerpool.sh` or similar,
-# pointed at WORKERPOOL_NODEPOOL_NAME.
+# Applies a minimal WorkerPool CR -- no ActorTemplate/workload attached,
+# deliberately not hack/install-demo-autoscaled-workerpool.sh (GKE isn't
+# supported there yet: it errors outright without ATE_INSTALL_KIND) or
+# hack/run-microvm-demo.sh (a bigger commitment: re-deploys the control
+# plane redundantly, needs a new GCS-bucket step for micro-VM asset
+# staging, and applies a specific demo actor template rather than empty
+# infrastructure) -- see ONBOARDING.md step 6 for the full comparison
+# that led here.
+#
+# sandboxClass: microvm ties this to WORKERPOOL_NODEPOOL_NAME explicitly
+# via spec.template.nodeSelector on GKE's own always-present
+# `cloud.google.com/gke-nodepool` label, rather than relying on the
+# `ate.dev/sandboxClass=microvm` node label docs/api-guide.md mentions --
+# nothing in this onboarding flow (or gcloud node-pool creation) applies
+# that label, so depending on it here would be unconfirmed. The
+# GKE-label nodeSelector is a real, always-true mechanism instead.
+#
+# Known limitation, deliberate given the "minimal manifest" scope: this
+# WorkerPool won't reach Ready until a `microvm`-class SandboxConfig
+# exists on the cluster, which this step does not create (that's
+# hack/install-microvm-deps.sh --install, which needs its own GCS bucket
+# -- out of scope here, flagged loudly to the user below instead of
+# silently applying something that can't work yet).
 install_workerpool() {
-  log_stub "installing the Substrate WorkerPool onto '${WORKERPOOL_NODEPOOL_NAME}'"
-  spinner_wait "Deploying WorkerPool resources..." 1
+  ensure_docker_repo # idempotent; no-op if already set this run
+
+  require_cmd kubectl
+
+  local run_tool_script="${SCRIPT_DIR}/../run-tool.sh"
+  if [[ ! -x "${run_tool_script}" ]]; then
+    log_error "Could not find hack/run-tool.sh (expected at ${run_tool_script})."
+    exit 1
+  fi
+
+  run_kubectl create namespace "${DEFAULT_WORKERPOOL_NAMESPACE}" --dry-run=client -o yaml | run_kubectl apply -f -
+
+  # Not run_kubectl: ateomImage below is a ko:// reference that only `ko`
+  # (not kubectl) knows how to build/push/resolve into a real image, the
+  # same reason every hack/install-demo-*.sh script pipes into `ko apply`
+  # rather than `kubectl apply`. This is a real build+push, not a quick
+  # call -- deliberately not wrapped in run_kubectl's short timeout.
+  cat <<EOF | KO_DOCKER_REPO="${KO_DOCKER_REPO}" "${run_tool_script}" ko apply -f - ${KUBECTL_CONTEXT:+-- --context="${KUBECTL_CONTEXT}"}
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: default
+  namespace: ${DEFAULT_WORKERPOOL_NAMESPACE}
+spec:
+  replicas: ${DEFAULT_WORKERPOOL_REPLICAS}
+  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-microvm
+  sandboxClass: microvm
+  template:
+    nodeSelector:
+      cloud.google.com/gke-nodepool: ${WORKERPOOL_NODEPOOL_NAME}
+EOF
+
+  log_warn "The WorkerPool won't reach Ready until a 'microvm' SandboxConfig exists on the cluster (hack/install-microvm-deps.sh --install, not run by this wizard)."
 }
 
 # deploy_default_workerpool

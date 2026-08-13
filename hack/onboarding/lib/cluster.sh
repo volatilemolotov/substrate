@@ -16,46 +16,84 @@
 
 # cluster.sh - discover and validate the target cluster.
 #
-# Public entry point: select_and_validate_cluster
-# Sets (on success): CLUSTER_NAME, CLUSTER_PROJECT, CLUSTER_LOCATION, CLUSTER_VERSION
-
-# list_clusters
-# TODO(gcloud): replace with something like:
-#   gcloud container clusters list --format="value(name,zone,status)"
-# and merge results across the projects the user has access to (or just
-# the current `gcloud config get-value project`).
+# Selection starts from the local kubeconfig (kubectl config get-contexts),
+# not from listing every cluster gcloud can see -- the user's kubeconfig
+# is the more direct signal of "which cluster do you mean", it can name
+# GKE clusters across multiple projects, and it works the same way for
+# non-GKE contexts (which just get correctly rejected in the gcloud
+# verification step, rather than never being offered at all).
 #
-# Prints one "name<TAB>project<TAB>location" row per cluster to stdout.
-list_clusters() {
-  log_stub "listing GKE clusters (gcloud container clusters list)"
-  cat <<EOF
-demo-cluster-a	my-gcp-project	us-central1
-demo-cluster-b	my-gcp-project	us-central1-a
-staging-cluster	my-other-project	europe-west4
-EOF
+# Public entry point: select_and_validate_cluster
+# Sets (on success): KUBECTL_CONTEXT, CLUSTER_NAME, CLUSTER_PROJECT,
+#                     CLUSTER_LOCATION, CLUSTER_VERSION
+#
+# KUBECTL_CONTEXT is what any later kubectl call (substrate.sh,
+# workerpool.sh once wired up) should pass via `--context=`, the same
+# pattern `run_kubectl()` in hack/install-ate.sh already uses -- never
+# `kubectl config use-context`, so this script doesn't mutate the user's
+# global kubectl state as a side effect.
+
+# GKE_CONTEXT_PATTERN matches the context name `gcloud container clusters
+# get-credentials` writes: gke_<project>_<location>_<cluster>. None of
+# those three components can contain an underscore (GCP project IDs,
+# zones/regions, and GKE cluster names are all restricted to lowercase
+# letters, digits, and hyphens), so splitting on "_" is unambiguous.
+readonly GKE_CONTEXT_PATTERN='^gke_([a-z0-9-]+)_([a-z0-9-]+)_([a-z0-9-]+)$'
+
+# list_kubeconfig_contexts
+# Prints one kubeconfig context name per line, in kubectl's own order.
+list_kubeconfig_contexts() {
+  require_cmd kubectl
+
+  local contexts
+  if ! contexts="$(kubectl config get-contexts -o name)"; then
+    log_error "kubectl failed to list kubeconfig contexts. See the error above and check your kubeconfig."
+    return 1
+  fi
+
+  echo "${contexts}"
+}
+
+# context_display_label CONTEXT_NAME
+# Best-effort human-readable label for the selection menu. Doesn't set
+# any globals -- it's only for display, so a context that doesn't match
+# GKE_CONTEXT_PATTERN still shows up (as its raw name) rather than being
+# hidden; the real gcloud verification happens after selection.
+context_display_label() {
+  local context="$1"
+  if [[ "${context}" =~ ${GKE_CONTEXT_PATTERN} ]]; then
+    printf '%s  (project: %s, location: %s)' "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s' "${context}"
+  fi
 }
 
 # select_cluster
-# Prompts the user to pick one of list_clusters' rows.
-# Sets CLUSTER_NAME, CLUSTER_PROJECT, CLUSTER_LOCATION.
+# Prompts the user to pick a kubeconfig context. Sets KUBECTL_CONTEXT.
 select_cluster() {
-  local rows=()
-  while IFS= read -r line; do
-    [[ -n "${line}" ]] && rows+=("${line}")
-  done < <(list_clusters)
+  local context_output
+  if ! context_output="$(list_kubeconfig_contexts)"; then
+    # list_kubeconfig_contexts already logged the specific reason.
+    return 1
+  fi
 
-  if [[ "${#rows[@]}" -eq 0 ]]; then
-    log_error "No GKE clusters found. Create one first, then re-run this script."
+  local contexts=()
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && contexts+=("${line}")
+  done <<< "${context_output}"
+
+  if [[ "${#contexts[@]}" -eq 0 ]]; then
+    log_error "No kubeconfig contexts found. Run 'gcloud container clusters get-credentials' for the cluster you want, then re-run this script."
     return 1
   fi
 
   local display=()
-  for row in "${rows[@]}"; do
-    display+=("$(echo "${row}" | awk -F'\t' '{printf "%s  (project: %s, location: %s)", $1, $2, $3}')")
+  for ctx in "${contexts[@]}"; do
+    display+=("$(context_display_label "${ctx}")")
   done
 
   local choice
-  choice="$(select_from_list "Select a cluster:" "${display[@]}")" || return 1
+  choice="$(select_from_list "Select a kubeconfig context:" "${display[@]}")" || return 1
 
   local index=-1
   for i in "${!display[@]}"; do
@@ -63,28 +101,44 @@ select_cluster() {
   done
   [[ "${index}" -ge 0 ]] || { log_error "Could not resolve selection"; return 1; }
 
-  CLUSTER_NAME="$(echo "${rows[$index]}" | awk -F'\t' '{print $1}')"
-  CLUSTER_PROJECT="$(echo "${rows[$index]}" | awk -F'\t' '{print $2}')"
-  CLUSTER_LOCATION="$(echo "${rows[$index]}" | awk -F'\t' '{print $3}')"
+  KUBECTL_CONTEXT="${contexts[$index]}"
+}
+
+# parse_gke_context CONTEXT_NAME
+# Authoritative parse of the selected context (as opposed to
+# context_display_label's best-effort one). On success, sets
+# CLUSTER_PROJECT / CLUSTER_LOCATION / CLUSTER_NAME and returns 0.
+# Returns 1 if the context doesn't match GKE_CONTEXT_PATTERN.
+parse_gke_context() {
+  local context="$1"
+  if [[ "${context}" =~ ${GKE_CONTEXT_PATTERN} ]]; then
+    CLUSTER_PROJECT="${BASH_REMATCH[1]}"
+    CLUSTER_LOCATION="${BASH_REMATCH[2]}"
+    CLUSTER_NAME="${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
 }
 
 # is_gke_cluster CLUSTER_NAME PROJECT LOCATION
-# TODO(gcloud): `gcloud container clusters describe` succeeding is
-# effectively the GKE check, since list_clusters above only lists GKE
-# clusters. Kept as a separate step in case cluster selection is ever
-# broadened to other sources (e.g. kubeconfig contexts) that could
-# include non-GKE clusters.
+# The real GKE check: confirms gcloud can describe a cluster by this
+# name/project/location, i.e. it actually exists and is reachable with
+# current credentials -- context name alone (parse_gke_context) is just
+# a naming convention, not proof.
 is_gke_cluster() {
-  log_stub "verifying cluster is GKE (gcloud container clusters describe)"
-  return 0
+  local cluster_name="$1" project="$2" location="$3"
+  gcloud container clusters describe "${cluster_name}" \
+    --project="${project}" --location="${location}" \
+    --format='value(name)' >/dev/null
 }
 
 # get_cluster_version CLUSTER_NAME PROJECT LOCATION
-# TODO(gcloud): gcloud container clusters describe --format="value(currentMasterVersion)"
-# Prints the version string to stdout.
+# Prints the control plane version string to stdout.
 get_cluster_version() {
-  log_stub "reading cluster control plane version"
-  echo "1.31.5-gke.1000"
+  local cluster_name="$1" project="$2" location="$3"
+  gcloud container clusters describe "${cluster_name}" \
+    --project="${project}" --location="${location}" \
+    --format='value(currentMasterVersion)'
 }
 
 # version_ge A B
@@ -110,17 +164,27 @@ check_cluster_version() {
 # select_and_validate_cluster
 # Orchestrates the steps above. Exits the calling script on failure.
 select_and_validate_cluster() {
+  require_cmd gcloud
+
   log_step "Select a cluster"
   select_cluster || exit 1
-  log_success "Selected ${CLUSTER_NAME} (project: ${CLUSTER_PROJECT}, location: ${CLUSTER_LOCATION})"
+  log_success "Selected kubeconfig context: ${KUBECTL_CONTEXT}"
 
   log_step "Validating cluster"
+  if ! parse_gke_context "${KUBECTL_CONTEXT}"; then
+    log_error "Context '${KUBECTL_CONTEXT}' doesn't look like a GKE context (expected gke_<project>_<location>_<cluster>, the format 'gcloud container clusters get-credentials' writes). Select a different context."
+    exit 1
+  fi
+
   if ! is_gke_cluster "${CLUSTER_NAME}" "${CLUSTER_PROJECT}" "${CLUSTER_LOCATION}"; then
     log_error "${CLUSTER_NAME} does not look like a GKE cluster."
     exit 1
   fi
 
-  CLUSTER_VERSION="$(get_cluster_version "${CLUSTER_NAME}" "${CLUSTER_PROJECT}" "${CLUSTER_LOCATION}")"
+  if ! CLUSTER_VERSION="$(get_cluster_version "${CLUSTER_NAME}" "${CLUSTER_PROJECT}" "${CLUSTER_LOCATION}")"; then
+    log_error "Failed to read the control plane version for ${CLUSTER_NAME}."
+    exit 1
+  fi
   if ! check_cluster_version "${CLUSTER_VERSION}"; then
     log_error "Cluster version ${CLUSTER_VERSION} is below the minimum supported version ${MIN_GKE_VERSION}."
     exit 1

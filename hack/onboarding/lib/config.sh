@@ -24,6 +24,29 @@
 # EDITME: confirm against the real support matrix.
 readonly MIN_GKE_VERSION="1.30.0"
 
+# Timeout applied to every kubectl call this script makes directly (via
+# run_kubectl in ui.sh) against the API server. Discovered the hard way:
+# with a stale gcloud auth token, gke-gcloud-auth-plugin can leave
+# `kubectl get` hanging for minutes with zero output instead of failing
+# fast the way a plain `gcloud` call does -- a quick existence check
+# should never be able to stall the whole wizard like that.
+readonly DEFAULT_KUBECTL_REQUEST_TIMEOUT="15s"
+
+# Flags passed to `hack/install-ate.sh --deploy-ate-system` for the
+# Quickstart path. These match that script's own defaults today; made
+# explicit here (rather than just omitting the flags and inheriting
+# whatever install-ate.sh currently defaults to) so the choice is visible
+# and a future default change over there doesn't silently change what
+# Quickstart installs.
+readonly DEFAULT_ATEAPI_CLIENT_AUTH="cert"
+readonly DEFAULT_ATENET_ROUTER="envoy"
+
+# Image name suggested (never silently applied) when the user enters
+# KO_DOCKER_REPO manually instead of picking an Artifact Registry repo
+# via gcloud -- the full suggestion becomes gcr.io/<project>/<this>.
+# EDITME.
+readonly DEFAULT_KO_DOCKER_REPO_IMAGE="agent-substrate"
+
 # Defaults used when the user asks the script to create the worker node
 # pool for them instead of running gcloud commands manually.
 # EDITME: confirm these against docs/demos/*/README.md sizing guidance.
@@ -32,16 +55,28 @@ readonly DEFAULT_WORKERPOOL_MACHINE_TYPE="n2-standard-8"
 readonly DEFAULT_WORKERPOOL_NODE_COUNT="3"
 readonly DEFAULT_WORKERPOOL_DISK_SIZE_GB="100"
 
-# Defaults used when the user asks the script to configure HPA + capacity
-# buffer automatically. "Capacity buffer" = idle/pre-warmed workers kept
-# ready ahead of demand, on top of whatever the HPA target implies.
+# Defaults used when the user asks the script to configure HPA
+# automatically: a standard autoscaling/v2 HorizontalPodAutoscaler
+# targeting the WorkerPool's /scale subresource (confirmed real --
+# demos/autoscaled-workerpool/hpa-kind.yaml does exactly this, with a
+# comment defining "capacity buffer" as minReplicas: a warm floor of
+# workers kept ready ahead of demand. DEFAULT_HPA_MIN_REPLICAS *is* the
+# capacity buffer here -- there is no separate field for it (there used
+# to be a redundant DEFAULT_CAPACITY_BUFFER_SIZE constant; removed once
+# this was confirmed against the real demo).
+#
+# Uses a plain CPU Resource metric (metrics-server, already on every GKE
+# cluster) rather than the demo's custom ate_workerpool_workers external
+# metric, which needs a whole self-hosted Prometheus + prometheus-adapter
+# stack this onboarding flow doesn't set up -- see ONBOARDING.md step 5
+# for the full reasoning and the option this deliberately didn't take.
 # EDITME: confirm these against docs/demos/*/README.md sizing guidance.
 readonly DEFAULT_HPA_MIN_REPLICAS="2"
 readonly DEFAULT_HPA_MAX_REPLICAS="10"
 readonly DEFAULT_HPA_TARGET_CPU_UTILIZATION="70"
-readonly DEFAULT_CAPACITY_BUFFER_SIZE="2"
 
-# Env var toggles used only to exercise the script's control flow before
-# the real gcloud/kubectl integrations exist. See ONBOARDING.md.
-: "${ONBOARD_STUB_SUBSTRATE_INSTALLED:=false}"
-: "${ONBOARD_STUB_VIRT_NODEPOOL_FOUND:=false}"
+# Namespace/replica count for the minimal default WorkerPool
+# install_workerpool applies (see workerpool.sh -- a bare WorkerPool CR,
+# no ActorTemplate/workload, sandboxClass: microvm). EDITME.
+readonly DEFAULT_WORKERPOOL_NAMESPACE="ate-workerpool"
+readonly DEFAULT_WORKERPOOL_REPLICAS="3"
