@@ -33,7 +33,10 @@ func TestParseValid(t *testing.T) {
 		"durdir_file_size_bytes": 1048576,
 		"resume_mode": "explicit",
 		"durdir_read_mode": "data",
-		"durdir_template": "glutton-durdir-data"
+		"durdir_template": "glutton-durdir-data",
+		"ttfi_timeout": 30.0,
+		"ttfi_template": "glutton",
+		"ttfi_cold_source": "coldboot"
 	}`)
 
 	cfg, err := Parse(jsonBlob, Config{})
@@ -61,6 +64,15 @@ func TestParseValid(t *testing.T) {
 	}
 	if cfg.DurDirTemplate != "glutton-durdir-data" {
 		t.Errorf("DurDirTemplate: got %q, want glutton-durdir-data", cfg.DurDirTemplate)
+	}
+	if cfg.TTFITimeout != 30*time.Second {
+		t.Errorf("TTFITimeout: got %v, want 30s", cfg.TTFITimeout)
+	}
+	if cfg.TTFITemplate != "glutton" {
+		t.Errorf("TTFITemplate: got %q, want glutton", cfg.TTFITemplate)
+	}
+	if cfg.TTFIColdSource != ColdSourceColdBoot {
+		t.Errorf("TTFIColdSource: got %q, want %q", cfg.TTFIColdSource, ColdSourceColdBoot)
 	}
 }
 
@@ -104,6 +116,14 @@ func TestParseInvalidValues(t *testing.T) {
 		{
 			name: "invalid read mode",
 			json: `{"durdir_read_mode": "invalid_read"}`,
+		},
+		{
+			name: "negative ttfi timeout",
+			json: `{"ttfi_timeout": -1.0}`,
+		},
+		{
+			name: "invalid ttfi cold source",
+			json: `{"ttfi_cold_source": "warmboot"}`,
 		},
 	}
 

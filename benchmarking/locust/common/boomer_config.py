@@ -20,6 +20,7 @@ Flag registration lives in the modules that own each flag:
   * --resume-mode                   → common.resume_mode.add_resume_mode_arguments
   * --durdir-*                      → common.durdir_config.add_durdir_arguments
   * --mem-target / --mem-churn / --mem-read → common.memload_config.add_memload_arguments
+  * --ttfi-*                        → common.ttfi_config.add_ttfi_arguments
 
 This module ties them together so boomer-Go workers can pick up the values
 the operator set in the web UI form:
@@ -56,6 +57,9 @@ _FLAGS = {
     "--mem-target": str,
     "--mem-churn": str,
     "--mem-read": str,
+    "--ttfi-timeout": float,
+    "--ttfi-template": str,
+    "--ttfi-cold-source": str,
 }
 
 
@@ -135,6 +139,7 @@ def init_boomer_config() -> None:
     from common.memload_config import add_memload_arguments
     from common.resume_mode import add_resume_mode_arguments
     from common.trace import init_tracing
+    from common.ttfi_config import add_ttfi_arguments
     from common.wait_time import init_wait_time
 
     init_tracing()

@@ -36,6 +36,7 @@ const (
 	ReadDiskRoute  = "/readdisk"
 	WriteRAMRoute  = "/writeram"
 	ReadRAMRoute   = "/readram"
+	PingRoute      = "/ping"
 )
 
 // Server is an httptest-backed stand-in for a glutton actor holding one file.
@@ -56,6 +57,17 @@ type Server struct {
 	Status int
 	// ElapsedUs sets the x-server-elapsed-us timing header/trailer.
 	ElapsedUs string
+	// PingFailures makes the first N /ping requests fail with PingFailStatus
+	// before the route starts answering, standing in for an actor that is
+	// still activating.
+	PingFailures int
+	// PingFailStatus is the status those first PingFailures requests return.
+	// Defaults to 503, the code the router returns when it cannot place a
+	// request on a worker.
+	PingFailStatus int
+	// PingEcho replaces the echoed message, so a caller that verifies the
+	// echo sees a mismatch.
+	PingEcho string
 
 	mu            sync.Mutex
 	paths         []string
@@ -64,6 +76,7 @@ type Server struct {
 	ramWriteSizes []string
 	ramWriteModes []gluttonpb.WriteMode
 	ramReadSizes  []string
+	pingCount     int
 }
 
 func (s *Server) reportedDigest() []byte {
@@ -125,6 +138,14 @@ func (s *Server) RecordedRAMReadSizes() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.ramReadSizes...)
+}
+
+// RecordedPings returns how many /ping requests the server has seen,
+// including the ones PingFailures rejected.
+func (s *Server) RecordedPings() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pingCount
 }
 
 func (s *Server) Start(t *testing.T) *httptest.Server {
@@ -228,6 +249,38 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 
 		resp, _ := proto.Marshal(&gluttonpb.ReadRAMResponse{Size: int64(len(s.Data))})
+		_, _ = w.Write(resp)
+
+	case PingRoute:
+		s.mu.Lock()
+		s.pingCount++
+		activating := s.pingCount <= s.PingFailures
+		s.mu.Unlock()
+		if activating {
+			status := s.PingFailStatus
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, http.StatusText(status), status)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var req gluttonpb.PingRequest
+		if err := proto.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		echo := req.GetMessage()
+		if s.PingEcho != "" {
+			echo = s.PingEcho
+		}
+
+		resp, _ := proto.Marshal(&gluttonpb.PingResponse{Message: echo})
 		_, _ = w.Write(resp)
 
 	default:

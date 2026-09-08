@@ -16,22 +16,47 @@ package glutton
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
+	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/dynconfig"
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
 	"github.com/agent-substrate/substrate/internal/benchmarking/glutton/fake"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
+
+// errResumeRefused stands in for a control plane that could not place the
+// actor on a worker.
+var errResumeRefused = errors.New("no worker available")
 
 type fakeControlClient struct {
 	ateapipb.ControlClient
-	mu          sync.Mutex
-	calls       []string
-	resumeBoots []bool
+	// resumeErr, when set, fails every ResumeActor call with it.
+	resumeErr error
+	// serverElapsedUs, when set, is returned as the x-server-elapsed-us
+	// trailer the real ServerUnaryInterceptor emits.
+	serverElapsedUs string
+	mu              sync.Mutex
+	calls           []string
+	resumeBoots     []bool
+}
+
+// setTrailer fills the caller's grpc.Trailer destination so a faked call can
+// carry the server's handler duration the way a real one does.
+func (f *fakeControlClient) setTrailer(opts []grpc.CallOption) {
+	if f.serverElapsedUs == "" {
+		return
+	}
+	for _, o := range opts {
+		if t, ok := o.(grpc.TrailerCallOption); ok && t.TrailerAddr != nil {
+			*t.TrailerAddr = metadata.Pairs(ateinterceptors.ServerElapsedTrailer, f.serverElapsedUs)
+		}
+	}
 }
 
 func (f *fakeControlClient) CreateAtespace(ctx context.Context, in *ateapipb.CreateAtespaceRequest, opts ...grpc.CallOption) (*ateapipb.Atespace, error) {
@@ -53,6 +78,10 @@ func (f *fakeControlClient) ResumeActor(ctx context.Context, in *ateapipb.Resume
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "ResumeActor")
 	f.resumeBoots = append(f.resumeBoots, in.GetBoot())
+	f.setTrailer(opts)
+	if f.resumeErr != nil {
+		return nil, f.resumeErr
+	}
 	return &ateapipb.ResumeActorResponse{}, nil
 }
 
@@ -102,6 +131,18 @@ func newTestConfig(t *testing.T, srv *fake.Server, cfg *userclass.Config) *userc
 	cfg.HTTPClient = ts.Client()
 	cfg.RouterURL = ts.URL
 	return cfg
+}
+
+func newTestTTFIUser(t *testing.T, srv *fake.Server, cfg *userclass.Config) *ttfiUser {
+	t.Helper()
+	c := newTestConfig(t, srv, cfg)
+	return &ttfiUser{
+		cfg:          c,
+		actorName:    "ttfiactor",
+		hostHeader:   "ttfiactor.benchmark." + actorDomain,
+		templateName: defaultTTFITemplate,
+		userClass:    ttfiUserClass,
+	}
 }
 
 func newTestDurDirUser(t *testing.T, srv *fake.Server, cfg *userclass.Config) *durDirUser {

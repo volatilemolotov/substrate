@@ -414,6 +414,102 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  # TTFI (time to first instruction): the wall clock a client waits before a
+  # sandbox takes work. Each entry reports TTFIColdStart (a new actor's first
+  # activation) and TTFIWarmStart (reactivating a suspended one), with the
+  # phase split on the trace span rather than spread across rows the reader
+  # has to add up. One user and one worker: TTFI is an activation latency, so
+  # a queue at the scheduler would be measured as if it were the sandbox
+  # starting. The last entry oversubscribes on purpose, to see what
+  # contention does to it.
+  - name: ttfi_golden_gvisor
+    type: locust
+    description: "TTFI baseline: explicit resume from the golden snapshot, gvisor"
+    targetCluster: dev
+    file: /app/tests/ttfi.py
+    duration: 2m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--resume-mode"
+      - "explicit"
+      - "--ttfi-cold-source"
+      - "golden"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: ttfi_golden_microvm
+    type: locust
+    description: "TTFI baseline: explicit resume from the golden snapshot, microvm"
+    targetCluster: dev
+    file: /app/tests/ttfi.py
+    duration: 2m
+    users: 1
+    workerCount: 1
+    sandboxClass: microvm
+    flags:
+      - "--resume-mode"
+      - "explicit"
+      - "--ttfi-cold-source"
+      - "golden"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  # What the golden snapshot is worth: same window, but the cold start skips
+  # it and brings the containers up from the OCI image instead. The warm rows
+  # of the two runs should agree, since only the cold path changes.
+  - name: ttfi_coldboot_gvisor
+    type: locust
+    description: "TTFI comparison: cold start from the OCI image instead of the golden snapshot, gvisor"
+    targetCluster: dev
+    file: /app/tests/ttfi.py
+    duration: 2m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--resume-mode"
+      - "explicit"
+      - "--ttfi-cold-source"
+      - "coldboot"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  # The path a real harness takes: no ResumeActor call, just traffic that the
+  # router parks while it wakes the actor. Needs request parking enabled, or
+  # the instruction retries absorb the 503s and TTFI reads high.
+  - name: ttfi_implicit_gvisor
+    type: locust
+    description: "TTFI: router-triggered activation with no explicit resume, gvisor"
+    targetCluster: dev
+    file: /app/tests/ttfi.py
+    duration: 2m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--resume-mode"
+      - "implicit"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: ttfi_contended_gvisor
+    type: locust
+    description: "TTFI under contention: 15 users on 10 workers (50% oversubscribed), gvisor"
+    targetCluster: dev
+    file: /app/tests/ttfi.py
+    duration: 3m
+    users: 15
+    workerCount: 10
+    flags:
+      - "--resume-mode"
+      - "implicit"
+      - "--min-wait-time"
+      - "0.5"
+      - "--max-wait-time"
+      - "1.0"
   - name: ingress_routercap_envoy_2cpu
     description: "Router capacity: Nighthawk adaptive max-RPS search under a 25ms tail-latency SLO, Envoy at 2 CPUs"
     type: nighthawk-ingress

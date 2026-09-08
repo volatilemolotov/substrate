@@ -109,6 +109,73 @@ and state restoration latency when a durable directory is attached to the actor.
 * `DurDirServeWarm`: Subsequent read within the same active cycle (cached state baseline).
 * `DurDirOverwrite`: In-place file overwrite with checksum verification.
 
+### TTFI Benchmark
+
+TTFI — time to first instruction — measures the wall clock a client waits
+before a sandbox accepts work. It is not the sum of the other benchmarks'
+rows: `ResumeActor` returning is not the same as the actor being reachable,
+and under implicit resume no `ResumeActor` RPC is issued at all. The window
+opens when the client wants the sandbox and closes when an instruction comes
+back correct, including the routing hop and any retry a real client would
+have made.
+
+Two windows are reported, because they answer different questions:
+
+* `TTFIColdStart`: a newly created actor with no snapshot of its own —
+  starting a new session.
+* `TTFIWarmStart`: an actor that exists and was suspended to object storage —
+  resuming an existing session. This is the number substrate's 100ms
+  activation target is about.
+
+#### TTFI Configuration Knobs
+
+* `--resume-mode`: who triggers the activation (shared with the DurDir
+  benchmark):
+  * `explicit` (default): the client calls `ResumeActor`, then sends the
+    instruction.
+  * `implicit`: no wake RPC — traffic reaches the router, which parks the
+    request and wakes the actor. This is the path a real agent harness takes.
+    It needs [request parking](../docs/request-parking.md) enabled, or the
+    retries absorb 503s and TTFI reads high.
+* `--ttfi-cold-source`: what supplies guest state on a cold start. `golden`
+  (default) restores the template's golden snapshot; `coldboot` skips it and
+  starts the containers from the OCI image. Rides on the `ResumeActor` boot
+  flag, so it applies to `--resume-mode explicit` only.
+* `--ttfi-template`: the ActorTemplate to measure (default `glutton`). Point
+  it at a template on another sandbox class or snapshot scope to compare them.
+* `--ttfi-timeout`: seconds to keep retrying the first instruction before
+  recording the window as a failure (default `60`).
+
+#### TTFI Reported Metrics
+
+* `TTFIColdStart` / `TTFIWarmStart`: the measurement — client wall clock for
+  the whole window. Unlike the other rows these deliberately do **not** use
+  the server's elapsed trailer: the gaps between phases are precisely what
+  TTFI measures, and a server-side number cannot see them.
+* `TTFIResume`: the `ResumeActor` RPC, in explicit mode only.
+* `TTFIInstruction`: the retry loop until an instruction is accepted.
+* `TTFISuspend`: the suspend that precedes each warm window. A precondition,
+  not part of the measurement — it runs outside the TTFI span.
+
+#### Reading a TTFI trace
+
+The row's latency is its parent span's duration, and each phase is a child
+span, so one sampled trace explains its own total without joining anything.
+The parent carries the split as attributes:
+
+| Attribute | Meaning |
+|---|---|
+| `ttfi.total_ms` | the measurement |
+| `ttfi.control_plane_ms` | ateapi's own handler time, from the server trailer |
+| `ttfi.instruction_ms` | the instruction phase, retries included |
+| `ttfi.attempts` | instructions sent before one was accepted |
+| `ttfi.resume_mode`, `ttfi.cold`, `ttfi.cold_source`, `ttfi.template` | which window this was |
+
+`ttfi.total_ms` minus `control_plane_ms` minus `instruction_ms` is the time
+substrate spent outside its own handlers — scheduling, snapshot fetch, and
+sandbox restore. Expand the `ateapi` `step.*` children of the same trace to
+see which of those it was.
+
 ### Viewing Traces
 You must have enabled otel tracing for your cluster to view traces.
 

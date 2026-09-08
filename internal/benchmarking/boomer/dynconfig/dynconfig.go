@@ -42,6 +42,13 @@ const (
 
 	ReadModeData   = "data"
 	ReadModeDigest = "digest"
+
+	// Cold-activation sources for the TTFI benchmark, mapping onto
+	// ResumeActorRequest.boot: Golden restores the template's golden
+	// snapshot (boot=false), ColdBoot skips it and starts the containers
+	// from the OCI image (boot=true).
+	ColdSourceGolden   = "golden"
+	ColdSourceColdBoot = "coldboot"
 )
 
 // Config is the dynamic-mutable subset of boomer's behavior. Holder swaps
@@ -57,6 +64,9 @@ type Config struct {
 	MemTarget        string // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
 	MemChurn         string // RAM re-randomized in place each cycle via WriteRAM rotate, suffixed (e.g. "64Mi"); "" disables
 	MemRead          string // RAM walked (one byte per page) via ReadRAM after each resume, suffixed (e.g. "1Gi") or "all"; "" disables
+	TTFITimeout      time.Duration
+	TTFITemplate     string // ActorTemplate the TTFIUser measures
+	TTFIColdSource   string // ColdSourceGolden | ColdSourceColdBoot
 }
 
 // Holder lets readers Load() the current Config and writers Store() a new
@@ -97,6 +107,9 @@ type payload struct {
 	MemTarget        *string  `json:"mem_target"`
 	MemChurn         *string  `json:"mem_churn"`
 	MemRead          *string  `json:"mem_read"`
+	TTFITimeout      *float64 `json:"ttfi_timeout"`
+	TTFITemplate     *string  `json:"ttfi_template"`
+	TTFIColdSource   *string  `json:"ttfi_cold_source"`
 }
 
 // Parse decodes a JSON blob (typically from a CLI flag) and merges its
@@ -169,6 +182,12 @@ func (c Config) Validate() error {
 	if c.DurDirReadMode != "" && c.DurDirReadMode != ReadModeData && c.DurDirReadMode != ReadModeDigest {
 		return fmt.Errorf("invalid durdir_read_mode %q: must be %q or %q", c.DurDirReadMode, ReadModeData, ReadModeDigest)
 	}
+	if c.TTFITimeout < 0 {
+		return fmt.Errorf("ttfi_timeout cannot be negative: %v", c.TTFITimeout)
+	}
+	if c.TTFIColdSource != "" && c.TTFIColdSource != ColdSourceGolden && c.TTFIColdSource != ColdSourceColdBoot {
+		return fmt.Errorf("invalid ttfi_cold_source %q: must be %q or %q", c.TTFIColdSource, ColdSourceGolden, ColdSourceColdBoot)
+	}
 	// MemTarget, MemChurn, and MemRead are passed to glutton verbatim
 	// (MemRead's "all" excepted, which the driver maps to an empty
 	// whole-array walk), which owns the parse; invalid values fail loudly
@@ -210,6 +229,15 @@ func (p payload) merge(current Config) Config {
 	}
 	if p.MemRead != nil {
 		out.MemRead = *p.MemRead
+	}
+	if p.TTFITimeout != nil {
+		out.TTFITimeout = time.Duration(*p.TTFITimeout * float64(time.Second))
+	}
+	if p.TTFITemplate != nil {
+		out.TTFITemplate = *p.TTFITemplate
+	}
+	if p.TTFIColdSource != nil {
+		out.TTFIColdSource = *p.TTFIColdSource
 	}
 	return out
 }
@@ -279,6 +307,9 @@ func StartPoll(
 					slog.String("mem_target", next.MemTarget),
 					slog.String("mem_churn", next.MemChurn),
 					slog.String("mem_read", next.MemRead),
+					slog.Duration("ttfi_timeout", next.TTFITimeout),
+					slog.String("ttfi_template", next.TTFITemplate),
+					slog.String("ttfi_cold_source", next.TTFIColdSource),
 				)
 			}
 		}
@@ -315,6 +346,9 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.String("mem_target", next.MemTarget),
 			slog.String("mem_churn", next.MemChurn),
 			slog.String("mem_read", next.MemRead),
+			slog.Duration("ttfi_timeout", next.TTFITimeout),
+			slog.String("ttfi_template", next.TTFITemplate),
+			slog.String("ttfi_cold_source", next.TTFIColdSource),
 		)
 	})
 }
